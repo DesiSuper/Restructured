@@ -4,11 +4,11 @@
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Fast Finder — Search</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
-:root{--red:#e50914;--bg1:#000;--bg2:#111;--txt:#fff;--box:#141414;--box-bd:rgba(255,255,255,.1);--txt-muted:#b3b3b3;--btn-c:rgba(255,255,255,.08);}
-html.light{--bg1:#f8f9fa;--bg2:#e9ecef;--txt:#121212;--box:#fff;--box-bd:rgba(0,0,0,.15);--txt-muted:#555;--btn-c:rgba(0,0,0,.06);}
+:root{--red:#e50914;--bg1:#000;--bg2:#111;--txt:#fff;--box:#141414;--box-bd:rgba(255,255,255,.1);--txt-muted:#b3b3b3;--btn-c:rgba(255,255,255,.08);--nav:rgba(0,0,0,.9);}
+html.light{--bg1:#f8f9fa;--bg2:#e9ecef;--txt:#121212;--box:#fff;--box-bd:rgba(0,0,0,.15);--txt-muted:#555;--btn-c:rgba(0,0,0,.06);--nav:rgba(255,255,255,.9);}
 *{margin:0;padding:0;box-sizing:border-box;}
 body{background:linear-gradient(to bottom,var(--bg1),var(--bg2));font-family:'DM Sans',sans-serif;color:var(--txt);min-height:100vh;transition:background .3s,color .3s;}
-.navbar{width:100%;padding:16px 4%;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:rgba(0,0,0,.9);backdrop-filter:blur(6px);z-index:10;gap:10px;}
+.navbar{width:100%;padding:16px 4%;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;background:var(--nav);backdrop-filter:blur(6px);z-index:10;gap:10px;transition:background .3s;}
 .logo{font-size:22px;font-weight:900;color:var(--red);display:flex;align-items:center;gap:8px;}
 .nf-icon{background:var(--red);color:#fff;padding:2px 7px;border-radius:3px;}
 .nav-right{display:flex;align-items:center;gap:10px;}
