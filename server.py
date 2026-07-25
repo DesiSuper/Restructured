@@ -145,9 +145,12 @@ async def root_route_handler(request):
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Fast Finder</title>
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700;900&display=swap" rel="stylesheet">
 <style>
-:root{--red:#e50914;--bg1:#000;--bg2:#111;--txt:#fff;--box-bd:rgba(255,255,255,.1);--txt-muted:#b3b3b3;}
+:root{--red:#e50914;--bg1:#000;--bg2:#111;--txt:#fff;--box-bd:rgba(255,255,255,.1);--txt-muted:#b3b3b3;--btn-c:rgba(255,255,255,.08);}
+html.light{--bg1:#f8f9fa;--bg2:#e9ecef;--txt:#121212;--box-bd:rgba(0,0,0,.15);--txt-muted:#555;--btn-c:rgba(0,0,0,.06);}
 *{margin:0;padding:0;box-sizing:border-box;}
-body{background:linear-gradient(to bottom,var(--bg1),var(--bg2));font-family:'DM Sans',sans-serif;color:var(--txt);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;}
+body{background:linear-gradient(to bottom,var(--bg1),var(--bg2));font-family:'DM Sans',sans-serif;color:var(--txt);min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:20px;transition:background .3s,color .3s;}
+.theme-btn{position:fixed;top:16px;right:16px;background:transparent;border:1px solid var(--box-bd);color:var(--txt);padding:7px 16px;border-radius:4px;font-family:'DM Sans',sans-serif;font-weight:700;font-size:13px;cursor:pointer;transition:.3s;}
+.theme-btn:hover{background:var(--btn-c);}
 .logo{font-size:28px;font-weight:900;color:var(--red);display:flex;align-items:center;gap:8px;margin-bottom:18px;}
 .nf-icon{background:var(--red);color:#fff;padding:2px 8px;border-radius:4px;}
 h1{font-size:18px;font-weight:700;color:var(--txt-muted);margin-bottom:30px;}
@@ -156,10 +159,13 @@ h1{font-size:18px;font-weight:700;color:var(--txt-muted);margin-bottom:30px;}
 </style>
 </head>
 <body>
+<button class="theme-btn" id="theme-btn">Theme</button>
 <div class="logo"><span class="nf-icon">F</span> FAST FINDER</div>
 <h1>🚀 High-Performance Stream Server Active</h1>
 <a href="/login" class="login-btn">Admin Login</a>
+<!--THEME_SCRIPT-->
 </body></html>"""
+    html = await inject_theme_script(html)
     return web.Response(text=html, content_type='text/html')
 
 
