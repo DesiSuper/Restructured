@@ -1,8 +1,15 @@
 <script>
-const docEl=document.documentElement, themeBtn=document.getElementById('theme-btn');
-if(localStorage.getItem('theme')==='light') docEl.classList.add('light');
-themeBtn.addEventListener('click',()=>{
-    let isLight = docEl.classList.toggle('light');
-    localStorage.setItem('theme', isLight ? 'light' : 'dark');
-});
+(() => {
+    const docEl = document.documentElement;
+    const themeBtn = document.getElementById('theme-btn');
+    if (!themeBtn) return;
+
+    const savedTheme = localStorage.getItem('theme');
+    if (savedTheme === 'light') docEl.classList.add('light');
+
+    themeBtn.addEventListener('click', () => {
+        const isLight = docEl.classList.toggle('light');
+        localStorage.setItem('theme', isLight ? 'light' : 'dark');
+    });
+})();
 </script>

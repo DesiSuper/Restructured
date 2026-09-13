@@ -1,43 +1,56 @@
+import hashlib
 import hmac
 import time
-import hashlib
+from functools import wraps
+
 from aiohttp import web
 
-from config import WEB_USERNAME, WEB_PASSWORD, SECRET_KEY
+from config import SECRET_KEY, WEB_PASSWORD, WEB_USERNAME
 
-SESSION_MAX_AGE = 7 * 24 * 3600  # 7 दिन तक login याद रखो
+SESSION_MAX_AGE = 7 * 24 * 3600
 
 
 def _sign(value: str) -> str:
-    return hmac.new(SECRET_KEY.encode(), value.encode(), hashlib.sha256).hexdigest()
+    return hmac.new(
+        SECRET_KEY.encode("utf-8"), value.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
 
 
 def create_session_token() -> str:
-    """Login सफल होने पर एक signed cookie token बनाओ"""
+    """Create a short signed, stateless admin session token."""
     expiry = str(int(time.time()) + SESSION_MAX_AGE)
     return f"{expiry}.{_sign(expiry)}"
 
 
 def is_valid_session(token: str) -> bool:
-    """Cookie से आया token असली है और अभी तक expire नहीं हुआ, ये चेक करो"""
+    """Validate a cookie token without ever raising on malformed input."""
+    if not isinstance(token, str):
+        return False
     try:
-        expiry, sig = token.split(".", 1)
-    except (ValueError, AttributeError):
+        expiry, signature = token.split(".", 1)
+        expiry_int = int(expiry)
+    except (AttributeError, TypeError, ValueError, OverflowError):
         return False
-    if not hmac.compare_digest(sig, _sign(expiry)):
+    if expiry_int <= int(time.time()):
         return False
-    return int(expiry) > int(time.time())
+    expected = _sign(expiry)
+    return hmac.compare_digest(signature, expected)
 
 
 def check_credentials(username: str, password: str) -> bool:
-    return hmac.compare_digest(username or "", WEB_USERNAME) and hmac.compare_digest(password or "", WEB_PASSWORD)
+    # compare_digest requires values of matching types and avoids timing leaks.
+    return hmac.compare_digest(str(username or ""), WEB_USERNAME) and hmac.compare_digest(
+        str(password or ""), WEB_PASSWORD
+    )
 
 
 def login_required(handler):
-    """Route decorator — बिना valid session cookie के /login पर redirect कर देगा"""
+    """Redirect unauthenticated panel requests to the login page."""
+
+    @wraps(handler)
     async def wrapper(request):
-        token = request.cookies.get("session", "")
-        if not is_valid_session(token):
+        if not is_valid_session(request.cookies.get("session", "")):
             raise web.HTTPFound("/login")
         return await handler(request)
+
     return wrapper

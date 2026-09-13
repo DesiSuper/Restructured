@@ -15,6 +15,7 @@ from aiohttp import web
 
 from server import routes
 from config import LOG_CHANNEL, API_ID, API_HASH, BOT_TOKEN, PORT, BIN_CHANNEL, ADMINS
+from database import ensure_indexes
 from utils import temp, get_readable_time
 from plugins.blacklist import load_blacklist_cache, load_pending_deletions
 
@@ -28,6 +29,7 @@ class Bot(Client):
             bot_token=BOT_TOKEN,
             plugins={"root": "plugins"}
         )
+        self.web_runner = None
 
     async def start(self):
         temp.START_TIME = time.time()
@@ -47,6 +49,7 @@ class Bot(Client):
                 pass
 
         temp.BOT = self
+        await ensure_indexes()
         me = await self.get_me()
         temp.ME     = me.id
         temp.U_NAME = me.username
@@ -62,9 +65,9 @@ class Bot(Client):
         # aiohttp web server start (streaming engine ke liye)
         web_app = web.Application()
         web_app.add_routes(routes)
-        runner  = web.AppRunner(web_app)
-        await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", PORT).start()
+        self.web_runner = web.AppRunner(web_app, access_log=None)
+        await self.web_runner.setup()
+        await web.TCPSite(self.web_runner, "0.0.0.0", PORT).start()
         print(f"🌐 Streaming Web Server active on port {PORT}!")
 
         # Log channel verification
@@ -90,7 +93,11 @@ class Bot(Client):
                 pass
 
     async def stop(self, *args):
+        if self.web_runner is not None:
+            await self.web_runner.cleanup()
+            self.web_runner = None
         await super().stop()
+        temp.BOT = None
         print("Bot Stopped! Bye...")
 
     async def iter_messages(
