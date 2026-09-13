@@ -90,26 +90,41 @@ player.on('ready',()=>{{
     r.innerHTML=ui('<path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6-8.5-6z"/>');
     c.append(l,r);
     
-    let tc=0, tmr;
-    const tap=(e,side,z)=>{{
-        e.preventDefault(); e.stopPropagation();
-        tc++; 
-        clearTimeout(tmr);
-        
-        let t = tc * 10; 
-        z.querySelector('.skip-text').innerText = t + 's';
-        z.classList.remove('active'); void z.offsetWidth; z.classList.add('active');
-        
-        tmr = setTimeout(() => {{
-            player.currentTime += side === 'l' ? -t : t; 
-            z.classList.remove('active'); 
-            tc = 0;
-        }}, 400);
+    const makeTapHandler=(side,z)=>{{
+        let taps=0, timer;
+        return (e)=>{{
+            e.preventDefault(); e.stopPropagation();
+            taps++;
+            clearTimeout(timer);
+            const seconds=taps*10;
+            z.querySelector('.skip-text').innerText=seconds+'s';
+            z.classList.remove('active'); void z.offsetWidth; z.classList.add('active');
+            timer=setTimeout(()=>{{
+                player.currentTime=Math.max(0,Math.min(player.duration || Infinity,
+                    player.currentTime+(side==='l'?-seconds:seconds)));
+                z.classList.remove('active');
+                taps=0;
+            }},400);
+        }};
     }};
-    ['dblclick','click'].forEach(ev=>{{l.addEventListener(ev,e=>{{e.preventDefault();e.stopPropagation()}});r.addEventListener(ev,e=>{{e.preventDefault();e.stopPropagation()}})}});
-    l.addEventListener('pointerup',e=>tap(e,'l',l)); r.addEventListener('pointerup',e=>tap(e,'r',r));
+    ['dblclick','click'].forEach(ev=>{{
+        l.addEventListener(ev,e=>{{e.preventDefault();e.stopPropagation()}});
+        r.addEventListener(ev,e=>{{e.preventDefault();e.stopPropagation()}});
+    }});
+    l.addEventListener('pointerup',makeTapHandler('l',l));
+    r.addEventListener('pointerup',makeTapHandler('r',r));
 }});
 
-function copyLink(){{navigator.clipboard.writeText("{src}"); let t=document.getElementById("toast"); t.classList.add("show"); setTimeout(()=>t.classList.remove("show"),3000);}}
+async function copyLink(){{
+    const url=document.querySelector('#player source').src;
+    try{{
+        await navigator.clipboard.writeText(url);
+        const t=document.getElementById('toast');
+        t.classList.add('show');
+        setTimeout(()=>t.classList.remove('show'),3000);
+    }}catch(error){{
+        window.prompt('Copy this link:',url);
+    }}
+}}
 </script>
 </body></html>

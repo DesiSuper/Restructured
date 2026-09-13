@@ -42,8 +42,15 @@ if len(BOT_TOKEN) == 0:
     print('Error - BOT_TOKEN is missing, exiting now')
     exit()
 
-PORT = int(environ.get('PORT', '80'))
-PICS = (environ.get('PICS', 'https://telegra.ph/file/58fef5cb458d5b29b0186.jpg')).split()
+try:
+    PORT = int(environ.get("PORT", "80"))
+    if not 1 <= PORT <= 65535:
+        raise ValueError
+except ValueError:
+    print("Error - PORT must be between 1 and 65535, exiting now")
+    exit()
+
+PICS = (environ.get("PICS") or "https://telegra.ph/file/58fef5cb458d5b29b0186.jpg").split()
 
 
 # ==========================================
@@ -63,8 +70,8 @@ else:
 # ==========================================
 
 INDEX_CHANNELS = [
-    int(x) if x.startswith("-") else x
-    for x in environ.get('INDEX_CHANNELS', '').split()
+    int(value) if re.fullmatch(r"-?\d+", value) else value
+    for value in environ.get("INDEX_CHANNELS", "").split()
 ]
 
 LOG_CHANNEL = environ.get('LOG_CHANNEL', '')
@@ -121,8 +128,12 @@ else:
 # ==========================================
 
 FILE_CAPTION = environ.get("FILE_CAPTION", "<b>{file_name}</b>")
-MAX_BTN = int(environ.get('MAX_BTN', 12))
-CACHE_TIME = int(environ.get('CACHE_TIME', 300))
+try:
+    MAX_BTN = max(1, min(50, int(environ.get("MAX_BTN", "12"))))
+    CACHE_TIME = max(0, int(environ.get("CACHE_TIME", "300")))
+except ValueError:
+    print("Error - MAX_BTN and CACHE_TIME must be valid integers, exiting now")
+    exit()
 IS_PM_SEARCH = is_enabled('IS_PM_SEARCH', True)
 PROTECT_CONTENT = is_enabled('PROTECT_CONTENT', False)
 REACTIONS = ["🤝", "😇", "🤗", "😍", "👍", "⚡️", "😎", "🔥"]

@@ -27,7 +27,8 @@ body{background:linear-gradient(to bottom,var(--bg1),var(--bg2));font-family:'DM
 .watch{background:var(--red);color:#fff;}
 .dl{background:rgba(255,255,255,.08);color:var(--txt);border:1px solid var(--box-bd);}
 .empty{color:var(--txt-muted);text-align:center;padding:40px 0;}
-.more{display:block;margin:16px auto 0;padding:11px 26px;border-radius:6px;background:rgba(255,255,255,.08);border:1px solid var(--box-bd);color:var(--txt);cursor:pointer;font-weight:700;}
+.more{display:block;margin:16px auto 0;padding:11px 26px;border-radius:6px;background:rgba(255,255,255,.08);border:1px solid var(--box-bd);color:var(--txt);cursor:pointer;font-weight:700;transition:opacity .2s;}
+.more:disabled{opacity:.55;cursor:wait;}
 @media(max-width:600px){.result{flex-direction:column;align-items:flex-start;}.actions{width:100%;}.actions a{flex:1;text-align:center;}}
 </style>
 </head>
@@ -45,50 +46,81 @@ body{background:linear-gradient(to bottom,var(--bg1),var(--bg2));font-family:'DM
 <button id="more" class="more" style="display:none;">Load More</button>
 </div>
 <script>
-let query = '', offset = 0;
+let query = '', offset = 0, requestId = 0, controller = null, loading = false;
 const resultsEl = document.getElementById('results');
 const moreBtn = document.getElementById('more');
+const searchBox = document.getElementById('search');
 let debounceTimer;
 
-function esc(s) {
+function esc(value) {
     const d = document.createElement('div');
-    d.textContent = s;
+    d.textContent = value == null ? '' : value;
     return d.innerHTML;
 }
 
 async function search(reset) {
-    if (reset) { offset = 0; resultsEl.innerHTML = ''; }
-    const res = await fetch(`/panel/api/search?q=${encodeURIComponent(query)}&offset=${offset}`);
-    const data = await res.json();
-
-    if (data.results.length === 0 && reset) {
-        resultsEl.innerHTML = '<div class="empty">No files found 🥲</div>';
+    const currentRequest = ++requestId;
+    if (reset) {
+        offset = 0;
+        resultsEl.replaceChildren();
         moreBtn.style.display = 'none';
-        return;
     }
+    if (controller) controller.abort();
+    controller = new AbortController();
+    loading = true;
+    moreBtn.disabled = true;
 
-    for (const f of data.results) {
-        const div = document.createElement('div');
-        div.className = 'result';
-        div.innerHTML = `<div><div class="name">${esc(f.file_name)}</div><div class="size">${esc(f.file_size)}</div></div>
-        <div class="actions">
-        <a class="watch" href="/panel/stream/${encodeURIComponent(f.file_id)}?mode=watch" target="_blank">Watch</a>
-        <a class="dl" href="/panel/stream/${encodeURIComponent(f.file_id)}?mode=download">Download</a>
-        </div>`;
-        resultsEl.appendChild(div);
+    try {
+        const res = await fetch(
+            `/panel/api/search?q=${encodeURIComponent(query)}&offset=${offset}`,
+            {signal: controller.signal, cache: 'no-store'}
+        );
+        if (!res.ok) throw new Error('Search request failed');
+        const data = await res.json();
+        // A slower request for an older keyword must not overwrite new results.
+        if (currentRequest !== requestId) return;
+
+        if (data.results.length === 0 && reset) {
+            resultsEl.innerHTML = '<div class="empty">No files found 🥲</div>';
+            moreBtn.style.display = 'none';
+            return;
+        }
+
+        for (const f of data.results) {
+            const div = document.createElement('div');
+            div.className = 'result';
+            div.innerHTML = `<div><div class="name">${esc(f.file_name)}</div><div class="size">${esc(f.file_size)}</div></div>
+            <div class="actions">
+            <a class="watch" href="/panel/stream/${encodeURIComponent(f.file_id)}?mode=watch" target="_blank" rel="noopener">Watch</a>
+            <a class="dl" href="/panel/stream/${encodeURIComponent(f.file_id)}?mode=download">Download</a>
+            </div>`;
+            resultsEl.appendChild(div);
+        }
+
+        offset = data.next_offset;
+        moreBtn.style.display = data.next_offset === '' ? 'none' : 'block';
+    } catch (error) {
+        if (error.name !== 'AbortError' && currentRequest === requestId) {
+            resultsEl.innerHTML = '<div class="empty">Search failed. Please try again.</div>';
+            moreBtn.style.display = 'none';
+        }
+    } finally {
+        if (currentRequest === requestId) {
+            loading = false;
+            moreBtn.disabled = false;
+        }
     }
-
-    offset = data.next_offset;
-    moreBtn.style.display = data.next_offset === '' ? 'none' : 'block';
 }
 
-document.getElementById('search').addEventListener('input', (e) => {
+searchBox.addEventListener('input', (event) => {
     clearTimeout(debounceTimer);
-    query = e.target.value;
-    debounceTimer = setTimeout(() => search(true), 400);
+    query = event.target.value.trim();
+    debounceTimer = setTimeout(() => search(true), 250);
 });
 
-moreBtn.addEventListener('click', () => search(false));
+moreBtn.addEventListener('click', () => {
+    if (!loading && offset !== '') search(false);
+});
 
 search(true);
 </script>

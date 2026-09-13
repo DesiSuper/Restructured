@@ -23,9 +23,10 @@ Public functions jo bahar (bot.py) se use hote hain:
     - load_pending_deletions(client) -> bot startup par (client ready hone ke baad) call karein
 """
 
+import asyncio
+import html
 import re
 import time
-import asyncio
 
 from hydrogram import Client, filters
 
@@ -43,6 +44,8 @@ pending_col   = _db["BlacklistPending"]    # Abhi jo messages delete hone ke liy
 # In-memory cache: [(pattern_str, compiled_regex, delay_seconds), ...]
 # Har message par DB call se bachne ke liye.
 _CACHE = []
+_PENDING_TASKS = {}
+_PENDING_LOCK = asyncio.Lock()
 
 
 def _wildcard_to_regex(pattern):
@@ -92,32 +95,48 @@ def _pending_key(chat_id, message_id):
 
 
 async def _schedule_delete(client, chat_id, message_id, delay_seconds, pattern_str):
-    """DB mein pending record save karo + RAM mein delete schedule karo"""
-    delete_at = time.time() + delay_seconds
+    """Persist a pending delete and schedule it once in the current process."""
     key = _pending_key(chat_id, message_id)
-    await pending_col.update_one(
-        {'_id': key},
-        {'$set': {
-            'chat_id': chat_id,
-            'message_id': message_id,
-            'delete_at': delete_at,
-            'pattern': pattern_str
-        }},
-        upsert=True
-    )
-    asyncio.create_task(_wait_and_delete(client, chat_id, message_id, delay_seconds))
+    async with _PENDING_LOCK:
+        if key in _PENDING_TASKS and not _PENDING_TASKS[key].done():
+            return
+
+        delay_seconds = max(0, int(delay_seconds))
+        delete_at = time.time() + delay_seconds
+        await pending_col.update_one(
+            {"_id": key},
+            {"$set": {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "delete_at": delete_at,
+                "pattern": pattern_str,
+            }},
+            upsert=True,
+        )
+        task = asyncio.create_task(
+            _wait_and_delete(client, chat_id, message_id, delay_seconds)
+        )
+        _PENDING_TASKS[key] = task
 
 
 async def _wait_and_delete(client, chat_id, message_id, delay_seconds):
+    key = _pending_key(chat_id, message_id)
     try:
         if delay_seconds > 0:
             await asyncio.sleep(delay_seconds)
         await client.delete_messages(chat_id, message_id)
-    except Exception as e:
-        print(f"Blacklist auto-delete error ({chat_id}/{message_id}): {e}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        print(f"Blacklist auto-delete error ({chat_id}/{message_id}): {error}")
     finally:
-        # Chahe delete safal hua ho ya fail — record clean kar do (RAM + DB dono se)
-        await pending_col.delete_one({'_id': _pending_key(chat_id, message_id)})
+        _PENDING_TASKS.pop(key, None)
+        # Whether deletion succeeded or the message was already gone, remove
+        # the durable queue entry so it cannot be retried forever.
+        try:
+            await pending_col.delete_one({"_id": key})
+        except Exception as error:
+            print(f"Blacklist queue cleanup error ({key}): {error}")
 
 
 async def load_pending_deletions(client):
@@ -126,12 +145,17 @@ async def load_pending_deletions(client):
     docs = await pending_col.find({}).to_list(length=None)
     now = time.time()
     for doc in docs:
-        remaining = doc.get('delete_at', now) - now
-        if remaining < 0:
-            remaining = 0  # time already nikal chuka — turant delete karo
-        asyncio.create_task(
-            _wait_and_delete(client, doc['chat_id'], doc['message_id'], remaining)
-        )
+        try:
+            remaining = max(0, float(doc.get("delete_at", now)) - now)
+            await _schedule_delete(
+                client,
+                doc["chat_id"],
+                doc["message_id"],
+                int(remaining),
+                doc.get("pattern", ""),
+            )
+        except (KeyError, TypeError, ValueError):
+            await pending_col.delete_one({"_id": doc.get("_id")})
 
 
 # ==========================================
@@ -174,7 +198,7 @@ async def blacklist_cmd(client, message):
         await _add_word(pattern, delay_seconds, message.from_user.id)
         await message.reply_text(
             f"<b>✅ Blacklisted!</b>\n\n"
-            f"🔹 Pattern: <code>{pattern}</code>\n"
+            f"🔹 Pattern: <code>{html.escape(pattern)}</code>\n"
             f"🔹 Auto-delete after: <b>{get_readable_time(delay_seconds)}</b>\n\n"
             f"Ab groups mein koi bhi admin ye bhejega to message {get_readable_time(delay_seconds)} mein auto-delete ho jaayega."
         )
@@ -186,9 +210,13 @@ async def blacklist_cmd(client, message):
         pattern = message.text.split(None, 2)[2].strip()
         removed = await _remove_word(pattern)
         if removed:
-            await message.reply_text(f"<b>✅ Removed from blacklist:</b> <code>{pattern}</code>")
+            await message.reply_text(
+                f"<b>✅ Removed from blacklist:</b> <code>{html.escape(pattern)}</code>"
+            )
         else:
-            await message.reply_text(f"<b>❌ Pattern not found in blacklist:</b> <code>{pattern}</code>")
+            await message.reply_text(
+                f"<b>❌ Pattern not found in blacklist:</b> <code>{html.escape(pattern)}</code>"
+            )
 
     # --- LIST ---
     elif action == "list":
@@ -197,7 +225,10 @@ async def blacklist_cmd(client, message):
             return await message.reply_text("<b>Blacklist khaali hai! 🗒️</b>")
         text = "<b>🚫 Blacklisted Patterns:</b>\n\n"
         for w in words:
-            text += f"🔹 <code>{w['_id']}</code> — auto-delete in {get_readable_time(w.get('delay', 60))}\n"
+            text += (
+                f"🔹 <code>{html.escape(str(w['_id']))}</code> — "
+                f"auto-delete in {get_readable_time(w.get('delay', 60))}\n"
+            )
         await message.reply_text(text)
 
     else:

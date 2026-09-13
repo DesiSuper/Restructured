@@ -1,19 +1,41 @@
-import time
+import html
 import math
 import random
-import asyncio
-from hydrogram import Client, filters, enums
+import secrets
+import time
+
+from hydrogram import Client, enums, filters
 from hydrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 
 from config import (
-    ADMINS, INDEX_CHANNELS, LOG_CHANNEL,
+    ADMINS, INDEX_CHANNELS,
     PICS, REACTIONS, BIN_CHANNEL, URL, MAX_BTN
 )
-from utils import get_size, temp, get_readable_time, get_wish
-from database import Media, get_file_details, delete_files, get_search_results, db
+from utils import get_bin_message, get_readable_time, get_size, get_wish, temp
+from database import (
+    Media,
+    db,
+    delete_files,
+    delete_all_files,
+    delete_files_by_query,
+    get_file_details,
+    get_search_results,
+)
 
-# PM search ke liye in-memory pagination state
+# Short-lived process-local callback state keeps Telegram callback_data small
+# even when an admin searches for a long filename.
 BUTTONS = {}
+STREAM_BUTTONS = {}
+DELETE_BUTTONS = {}
+
+
+def build_file_links(files):
+    """Render one consistent Telegram link list for search pages."""
+    return "".join(
+        f"\n\n📁 <a href='https://t.me/{temp.U_NAME}?start=file_{file.file_id}'>"
+        f"[{get_size(file.file_size)}] {html.escape(file.file_name)}</a>"
+        for file in files
+    )
 
 
 # ==========================================
@@ -45,9 +67,16 @@ async def start(client, message):
 
         file = file_details[0]
         from config import script
-        cap = script.FILE_CAPTION.format(file_name=file.file_name)
+        cap = script.FILE_CAPTION.format(file_name=html.escape(file.file_name))
+        if len(STREAM_BUTTONS) > 1000:
+            STREAM_BUTTONS.clear()
+        stream_token = secrets.token_urlsafe(8)
+        STREAM_BUTTONS[stream_token] = file.file_id
         btn = [[
-            InlineKeyboardButton("🚀 Watch And Download ⚡", callback_data=f"stream#{file.file_id}")
+            InlineKeyboardButton(
+                "🚀 Watch And Download ⚡",
+                callback_data=f"stream#{stream_token}",
+            )
         ], [
             InlineKeyboardButton("🙅 Close", callback_data="close_data")
         ]]
@@ -109,11 +138,12 @@ async def stats(bot, message):
         await message.react(emoji="⚡️", big=True)
 
     from config import script
-    files        = await Media.count_documents()
+    files = await Media.count_documents()
     admins_count = len(ADMINS)
-    uptime       = get_readable_time(time.time() - temp.START_TIME)
-    u_size       = get_size(await db.get_db_size())
-    f_size       = get_size(max(0, 536870912 - await db.get_db_size()))
+    uptime = get_readable_time(time.time() - temp.START_TIME)
+    database_size = await db.get_db_size()
+    u_size = get_size(database_size)
+    f_size = get_size(max(0, 536870912 - database_size))
 
     await message.reply_text(script.STATUS_TXT.format(files, admins_count, u_size, f_size, uptime))
 
@@ -127,25 +157,31 @@ async def delete_file(bot, message):
     if message.from_user.id not in ADMINS:
         return
 
-    try:
-        query = message.text.split(" ", 1)[1].strip()
-    except IndexError:
-        return await message.reply_text("<b>Command Incomplete!\nUsage: <code>/delete keyword</code></b>")
+    parts = (message.text or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        return await message.reply_text(
+            "<b>Command Incomplete!\nUsage: <code>/delete keyword</code></b>"
+        )
+    query = parts[1].strip()
 
-    msg   = await message.reply_text('Searching... ⏱️')
+    msg = await message.reply_text("Searching... ⏱️")
     total, _ = await delete_files(query)
 
     if int(total) == 0:
         return await msg.edit('No files found in the database with this keyword! ❌')
 
+    if len(DELETE_BUTTONS) > 500:
+        DELETE_BUTTONS.clear()
+    token = secrets.token_urlsafe(8)
+    DELETE_BUTTONS[token] = (message.from_user.id, query)
     btn = [
-        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"delete_{query}")],
-        [InlineKeyboardButton("❌ Cancel",      callback_data="close_data")]
+        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"delete#{token}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="close_data")],
     ]
     await msg.edit(
-        f"🔍 Found total <b>{total}</b> files for your query: <code>{query}</code>.\n\n"
-        f"Are you sure you want to delete them from the database permanently?",
-        reply_markup=InlineKeyboardMarkup(btn)
+        f"🔍 Found total <b>{total}</b> files for your query: <code>{html.escape(query)}</code>.\n\n"
+        "Are you sure you want to delete them from the database permanently?",
+        reply_markup=InlineKeyboardMarkup(btn),
     )
 
 
@@ -206,7 +242,7 @@ async def link_command(client, message):
         return await message.reply_text("<b>Ye ek valid file, video ya audio nahi hai! ❌</b>")
 
     sts = await message.reply_text("<b>Generating links... ⏱️</b>")
-    msg = await client.send_cached_media(chat_id=BIN_CHANNEL, file_id=media.file_id)
+    msg = await get_bin_message(client, BIN_CHANNEL, media.file_id)
 
     watch    = f"{URL}watch/{msg.id}"
     download = f"{URL}download/{msg.id}"
@@ -305,7 +341,9 @@ async def pm_search(client, message):
     if not files:
         from config import script
         await message.reply(
-            script.NOT_FILE_TXT.format(message.from_user.mention, search),
+            script.NOT_FILE_TXT.format(
+                message.from_user.mention, html.escape(search)
+            ),
             quote=True
         )
         return
@@ -316,9 +354,7 @@ async def pm_search(client, message):
         BUTTONS.clear()
     BUTTONS[key] = search
 
-    files_link = ""
-    for file in files:
-        files_link += f"\n\n📁 <a href='https://t.me/{temp.U_NAME}?start=file_{file.file_id}'>[{get_size(file.file_size)}] {file.file_name}</a>"
+    files_link = build_file_links(files)
 
     btn = []
     if offset != "":
@@ -356,9 +392,7 @@ async def next_page(bot, query):
     if not files:
         return
 
-    files_link = ""
-    for file in files:
-        files_link += f"\n\n📁 <a href='https://t.me/{temp.U_NAME}?start=file_{file.file_id}'>[{get_size(file.file_size)}] {file.file_name}</a>"
+    files_link = build_file_links(files)
 
     current_page = math.ceil(int(offset) / MAX_BTN) + 1
     total_pages  = math.ceil(total / MAX_BTN)
@@ -385,59 +419,97 @@ async def next_page(bot, query):
 # 🎛️ ALL CALLBACKS  (was cb_handler)
 # ==========================================
 
-@Client.on_callback_query()
+@Client.on_callback_query(~filters.regex(r"^(index|next)"))
 async def cb_handler(client: Client, query: CallbackQuery):
-    data    = query.data
+    data = query.data or ""
     user_id = query.from_user.id
 
+    # All bot functions are admin-only.  Checking callbacks as well as
+    # commands prevents a copied callback payload from being reused by a
+    # different Telegram account.
+    if user_id not in ADMINS:
+        return await query.answer("Admin access required", show_alert=True)
+
     # --- Stream / Download links ---
-    if data.startswith("stream"):
-        file_id = data.split('#', 1)[1]
+    if data.startswith("stream#"):
+        stream_token = data.split("#", 1)[1]
+        file_id = STREAM_BUTTONS.get(stream_token)
+        if not file_id:
+            return await query.answer("This link expired, please search again", show_alert=True)
         await query.answer("Generating streaming links... ⏱️")
-
-        msg      = await client.send_cached_media(chat_id=BIN_CHANNEL, file_id=file_id)
-        watch    = f"{URL}watch/{msg.id}"
+        msg = await get_bin_message(client, BIN_CHANNEL, file_id)
+        watch = f"{URL}watch/{msg.id}"
         download = f"{URL}download/{msg.id}"
-
-        btn = [[
-            InlineKeyboardButton("⚡ Watch Online", url=watch),
-            InlineKeyboardButton("🚀 Fast Download", url=download)
-        ], [
-            InlineKeyboardButton("🙅 Close", callback_data="close_data")
-        ]]
+        btn = [
+            [
+                InlineKeyboardButton("⚡ Watch Online", url=watch),
+                InlineKeyboardButton("🚀 Fast Download", url=download),
+            ],
+            [InlineKeyboardButton("🙅 Close", callback_data="close_data")],
+        ]
         await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(btn))
+
+    # --- Delete one query ---
+    elif data.startswith("delete#"):
+        token = data.split("#", 1)[1]
+        owner_and_query = DELETE_BUTTONS.pop(token, None)
+        if not owner_and_query or owner_and_query[0] != user_id:
+            return await query.answer("This confirmation is not for you", show_alert=True)
+        result = await delete_files_by_query(owner_and_query[1])
+        await query.answer(f"Deleted {result.deleted_count} file(s)")
+        await query.message.edit_text(
+            f"✅ Deleted <b>{result.deleted_count}</b> file(s) from the database."
+        )
+
+    # --- Delete the whole index ---
+    elif data == "delete_all":
+        result = await delete_all_files()
+        await query.answer(f"Deleted {result.deleted_count} file(s)")
+        await query.message.edit_text(
+            f"✅ Database wiped. <b>{result.deleted_count}</b> file(s) removed."
+        )
 
     # --- Close (generic) ---
     elif data == "close_data":
         await query.message.delete()
 
     # --- Close (user-specific) ---
-    elif data.startswith("close"):
-        _, req = data.split("#")
-        if int(req) == user_id:
+    elif data.startswith("close#"):
+        try:
+            requested_user = int(data.split("#", 1)[1])
+        except (IndexError, ValueError):
+            return await query.answer("Invalid button", show_alert=True)
+        if requested_user == user_id:
             await query.message.delete()
         else:
             await query.answer("This is not for you! ❌", show_alert=True)
 
     # --- Page indicator (no-op) ---
     elif data == "buttons":
-        await query.answer("⚙️", show_alert=False)
+        await query.answer("⚙️")
 
     # --- Commands List ---
     elif data == "help":
         from config import script
-        btn = [[
-            InlineKeyboardButton("🔙 Back", callback_data="start_back")
-        ], [
-            InlineKeyboardButton("🙅 Close", callback_data="close_data")
-        ]]
-        await query.message.edit_caption(caption=script.ADMIN_COMMAND_TXT, reply_markup=InlineKeyboardMarkup(btn))
+
+        btn = [
+            [InlineKeyboardButton("🔙 Back", callback_data="start_back")],
+            [InlineKeyboardButton("🙅 Close", callback_data="close_data")],
+        ]
+        await query.message.edit_caption(
+            caption=script.ADMIN_COMMAND_TXT,
+            reply_markup=InlineKeyboardMarkup(btn),
+        )
 
     # --- Back to /start ---
     elif data == "start_back":
         from config import script
+
         btn = [[InlineKeyboardButton("⚙️ Commands List", callback_data="help")]]
         await query.message.edit_caption(
             caption=script.START_TXT.format(query.from_user.mention, get_wish()),
-            reply_markup=InlineKeyboardMarkup(btn)
+            reply_markup=InlineKeyboardMarkup(btn),
         )
+
+    else:
+        await query.answer("Unknown or expired button", show_alert=True)

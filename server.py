@@ -1,41 +1,108 @@
+import asyncio
+import html
 import math
-import mimetypes
-import aiofiles
-from typing import Union
+import re
+from typing import AsyncIterator
 from urllib.parse import quote
+
+import aiofiles
 from aiohttp import web
 
 from hydrogram import Client, raw
-from hydrogram.session import Session, Auth
 from hydrogram.errors import AuthBytesInvalid
 from hydrogram.file_id import FileId, FileType
+from hydrogram.session import Auth, Session
 from hydrogram.types import Message
 
-from config import URL, BIN_CHANNEL
-from utils import temp, get_size
-from database import get_search_results, get_file_details
-from web_auth import login_required, check_credentials, create_session_token, SESSION_MAX_AGE
+from config import BIN_CHANNEL, URL
+from database import get_file_details, get_search_results
+from utils import get_bin_message, get_size, temp
+from web_auth import (
+    SESSION_MAX_AGE,
+    check_credentials,
+    create_session_token,
+    login_required,
+)
 
 routes = web.RouteTableDef()
+_TEMPLATE_CACHE = {}
+_TEMPLATE_LOCK = asyncio.Lock()
 
 
-async def inject_theme_script(html: str) -> str:
-    """Sabhi web pages (watch/login/panel) me shared theme-toggle script inject karo"""
-    async with aiofiles.open('web/template/theme_script.html', mode='r', encoding='utf-8') as r:
-        theme_script = await r.read()
-    return html.replace('<!--THEME_SCRIPT-->', theme_script)
+async def load_template(path: str) -> str:
+    """Read a static template once and reuse it for subsequent requests."""
+    cached = _TEMPLATE_CACHE.get(path)
+    if cached is not None:
+        return cached
+    async with _TEMPLATE_LOCK:
+        cached = _TEMPLATE_CACHE.get(path)
+        if cached is None:
+            async with aiofiles.open(path, mode="r", encoding="utf-8") as reader:
+                cached = await reader.read()
+            _TEMPLATE_CACHE[path] = cached
+    return cached
+
+
+async def inject_theme_script(page: str) -> str:
+    """Inject the shared theme-toggle script into a web page."""
+    theme_script = await load_template("web/template/theme_script.html")
+    return page.replace("<!--THEME_SCRIPT-->", theme_script)
 
 
 # ==========================================
 # 🚀 CORE STREAMING & CHUNK YIELDER ENGINE
 # ==========================================
 
-async def chunk_size(length):
-    return 2 ** max(min(math.ceil(math.log2(length / 1024)), 10), 2) * 1024
+# Telegram accepts upload.getFile chunks up to 1 MiB.  The old implementation
+# topped out at 10 KiB, which made large downloads needlessly slow.
+MIN_CHUNK_SIZE = 64 * 1024
+MAX_CHUNK_SIZE = 1024 * 1024
+_MEDIA_SESSION_LOCK = asyncio.Lock()
 
-async def offset_fix(offset, chunksize):
-    offset -= offset % chunksize
-    return offset
+
+def chunk_size(length: int) -> int:
+    """Choose a Telegram-friendly chunk size for a requested byte range."""
+    length = max(1, int(length))
+    target = min(MAX_CHUNK_SIZE, max(MIN_CHUNK_SIZE, length // 8 or MIN_CHUNK_SIZE))
+    # upload.getFile limits are 1 KiB aligned.
+    return max(MIN_CHUNK_SIZE, min(MAX_CHUNK_SIZE, (target // 1024) * 1024))
+
+
+def offset_fix(offset: int, chunksize: int) -> int:
+    return max(0, int(offset) - (int(offset) % int(chunksize)))
+
+
+def parse_range_header(value: str, file_size: int):
+    """Parse a single HTTP byte range and return ``(start, end)``.
+
+    Multi-range responses are not useful for a video element and would require
+    multipart encoding, so they are rejected with a normal 416 response.
+    """
+    if not value:
+        return 0, file_size - 1, False
+    if not value.lower().startswith("bytes=") or "," in value:
+        raise ValueError("Only one byte range is supported")
+
+    raw_range = value[6:].strip()
+    if "-" not in raw_range:
+        raise ValueError("Invalid byte range")
+    start_text, end_text = (part.strip() for part in raw_range.split("-", 1))
+
+    if not start_text:
+        # Suffix range: bytes=-N
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise ValueError("Invalid suffix range")
+        start = max(0, file_size - suffix_length)
+        return start, file_size - 1, True
+
+    start = int(start_text)
+    if start < 0 or start >= file_size:
+        raise ValueError("Range starts past end of file")
+    end = file_size - 1 if not end_text else int(end_text)
+    if end < start:
+        raise ValueError("Range end precedes start")
+    return start, min(end, file_size - 1), True
 
 
 class TGCustomYield:
@@ -53,14 +120,22 @@ class TGCustomYield:
         return file_id_obj
 
     async def generate_media_session(self, client: Client, file_id_obj: FileId):
-        media_session = client.media_sessions.get(file_id_obj.dc_id, None)
-        if media_session is None:
+        # Several browser range requests commonly arrive together.  Serialize
+        # session creation so they cannot all try to export authorization at
+        # the same time.
+        async with _MEDIA_SESSION_LOCK:
+            media_session = client.media_sessions.get(file_id_obj.dc_id)
+            if media_session is not None:
+                return media_session
+
             is_test_mode = await client.storage.test_mode()
             if file_id_obj.dc_id != await client.storage.dc_id():
                 media_session = Session(
-                    client, file_id_obj.dc_id,
+                    client,
+                    file_id_obj.dc_id,
                     await Auth(client, file_id_obj.dc_id, is_test_mode).create(),
-                    is_test_mode, is_media=True
+                    is_test_mode,
+                    is_media=True,
                 )
                 await media_session.start()
                 for _ in range(3):
@@ -75,20 +150,21 @@ class TGCustomYield:
                         )
                     except AuthBytesInvalid:
                         continue
-                    else:
-                        break
+                    break
                 else:
                     await media_session.stop()
                     raise AuthBytesInvalid
             else:
                 media_session = Session(
-                    client, file_id_obj.dc_id,
+                    client,
+                    file_id_obj.dc_id,
                     await client.storage.auth_key(),
-                    is_test_mode, is_media=True
+                    is_test_mode,
+                    is_media=True,
                 )
                 await media_session.start()
             client.media_sessions[file_id_obj.dc_id] = media_session
-        return media_session
+            return media_session
 
     @staticmethod
     async def get_location(file_id: FileId):
@@ -103,34 +179,39 @@ class TGCustomYield:
         )
 
     async def yield_file(
-        self, file_id_obj: FileId,
-        offset: int, first_part_cut: int,
-        last_part_cut: int, part_count: int, chunk_size: int
-    ) -> Union[bytes, None]:
+        self,
+        file_id_obj: FileId,
+        offset: int,
+        first_part_cut: int,
+        last_part_cut: int,
+        part_count: int,
+        chunk_size: int,
+    ) -> AsyncIterator[bytes]:
         media_session = await self.generate_media_session(self.client, file_id_obj)
-        current_part  = 1
-        location      = await self.get_location(file_id_obj)
+        location = await self.get_location(file_id_obj)
 
-        r = await media_session.send(
-            raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size)
-        )
-        if isinstance(r, raw.types.upload.File):
-            while current_part <= part_count:
-                chunk = r.bytes
-                if not chunk:
-                    break
-                offset += chunk_size
-                if part_count == 1:
-                    yield chunk[first_part_cut:last_part_cut]
-                    break
-                if current_part == 1:
-                    yield chunk[first_part_cut:]
-                if 1 < current_part <= part_count:
-                    yield chunk
-                r = await media_session.send(
-                    raw.functions.upload.GetFile(location=location, offset=offset, limit=chunk_size)
+        for part_number in range(part_count):
+            response = await media_session.send(
+                raw.functions.upload.GetFile(
+                    location=location,
+                    offset=offset + part_number * chunk_size,
+                    limit=chunk_size,
                 )
-                current_part += 1
+            )
+            if not isinstance(response, raw.types.upload.File) or not response.bytes:
+                break
+
+            chunk = response.bytes
+            if part_count == 1:
+                # Both cuts refer to the same Telegram chunk.
+                chunk = chunk[first_part_cut:last_part_cut]
+            elif part_number == 0:
+                chunk = chunk[first_part_cut:]
+            elif part_number == part_count - 1:
+                # On later chunks the start is already aligned.
+                chunk = chunk[:last_part_cut]
+            if chunk:
+                yield chunk
 
 
 # ==========================================
@@ -183,83 +264,135 @@ async def watch_handler(request):
             )
 
         file_properties = await TGCustomYield.generate_file_properties(media_msg)
-        file_name       = file_properties.file_name
-        src             = f"{URL}download/{message_id}"
-        mime_type       = file_properties.mime_type or 'video/mp4'
-        tag             = mime_type.split('/')[0].strip()
+        file_name = str(file_properties.file_name or "Unnamed file")
+        src = f"{URL}download/{message_id}?inline=1"
+        mime_type = str(file_properties.mime_type or "video/mp4")
+        tag = mime_type.split("/", 1)[0].strip().lower()
 
-        if tag == 'video':
-            async with aiofiles.open('web/template/watch.html', mode='r', encoding='utf-8') as r:
-                template_content = await r.read()
+        if tag == "video":
+            template_content = await load_template("web/template/watch.html")
 
-            safe_name = file_name.replace("{", "{{").replace("}", "}}")
-            html = template_content.format(
+            # Escape values before inserting them into HTML and protect the
+            # template's literal braces for str.format().
+            safe_name = html.escape(file_name, quote=True).replace("{", "{{").replace("}", "}}")
+            safe_mime = html.escape(mime_type, quote=True).replace("{", "{{").replace("}", "}}")
+            safe_src = html.escape(src, quote=True).replace("{", "{{").replace("}", "}}")
+            rendered = template_content.format(
                 heading=f"Watch - {safe_name}",
                 file_name=safe_name,
-                src=src,
-                mime_type=mime_type
+                src=safe_src,
+                mime_type=safe_mime,
             )
-            html = await inject_theme_script(html)
-            return web.Response(text=html, content_type='text/html')
+            return web.Response(
+                text=await inject_theme_script(rendered),
+                content_type="text/html",
+                headers={"Cache-Control": "no-store"},
+            )
         else:
             return web.Response(
                 text="<h1>This file format is not supported for online streaming! 😕</h1>",
                 content_type='text/html'
             )
-    except Exception as e:
-        return web.Response(text=f"<h1>Watch Engine Error: {e}</h1>", content_type='text/html')
+    except (TypeError, ValueError):
+        return web.Response(status=400, text="Invalid message id", content_type="text/plain")
+    except Exception:
+        import logging
+
+        logging.exception("Watch page error")
+        return web.Response(status=502, text="Watch page is temporarily unavailable", content_type="text/plain")
 
 
-@routes.get("/download/{message_id}")
+@routes.get("/download/{message_id}", allow_head=True)
 async def download_handler(request):
-    """Direct high-speed chunk streamer using BIN_CHANNEL fresh references"""
+    """Stream a Telegram file with correct, resumable HTTP range support."""
     try:
-        message_id = int(request.match_info['message_id'])
-        media_msg  = await temp.BOT.get_messages(BIN_CHANNEL, message_id)
-
+        message_id = int(request.match_info["message_id"])
+        media_msg = await temp.BOT.get_messages(BIN_CHANNEL, message_id)
         if not media_msg or media_msg.empty:
-            return web.Response(text="<h1>File not found! ❌</h1>", content_type='text/html')
+            return web.Response(status=404, text="File not found", content_type="text/plain")
 
         file_properties = await TGCustomYield.generate_file_properties(media_msg)
-        media_obj       = media_msg.document or media_msg.video or media_msg.audio
-        file_id_obj     = FileId.decode(media_obj.file_id)
-        file_size       = file_properties.file_size
+        media_obj = media_msg.document or media_msg.video or media_msg.audio
+        file_id_obj = FileId.decode(media_obj.file_id)
+        file_size = int(file_properties.file_size or 0)
+        if file_size <= 0:
+            return web.Response(status=404, text="File has no readable size", content_type="text/plain")
 
-        range_header = request.headers.get('Range', 0)
-        if range_header:
-            from_bytes, until_bytes = range_header.replace('bytes=', '').split('-')
-            from_bytes  = int(from_bytes)
-            until_bytes = int(until_bytes) if until_bytes else file_size - 1
-        else:
-            from_bytes  = request.http_range.start or 0
-            until_bytes = request.http_range.stop or file_size - 1
+        try:
+            start, end, is_partial = parse_range_header(
+                request.headers.get("Range", ""), file_size
+            )
+        except (TypeError, ValueError, OverflowError):
+            return web.Response(
+                status=416,
+                text="Requested range is not satisfiable",
+                headers={"Content-Range": f"bytes */{file_size}"},
+            )
 
-        req_length     = (until_bytes - from_bytes) + 1
-        new_chunk_size = await chunk_size(req_length)
-        offset         = await offset_fix(from_bytes, new_chunk_size)
-        first_part_cut = from_bytes - offset
-        last_part_cut  = (until_bytes % new_chunk_size) + 1
-        part_count     = math.ceil(req_length / new_chunk_size)
+        requested_length = end - start + 1
+        selected_chunk_size = chunk_size(requested_length)
+        aligned_offset = offset_fix(start, selected_chunk_size)
+        first_part_cut = start - aligned_offset
+        # Number of chunks needed includes the unaligned bytes before start.
+        part_count = math.ceil((first_part_cut + requested_length) / selected_chunk_size)
+        last_part_cut = (end % selected_chunk_size) + 1
 
-        body           = TGCustomYield().yield_file(
-            file_id_obj, offset, first_part_cut, last_part_cut, part_count, new_chunk_size
-        )
-        mime_type      = file_properties.mime_type or 'application/octet-stream'
-        safe_file_name = quote(file_properties.file_name)
-
+        file_name = str(file_properties.file_name or f"file-{message_id}")
+        # Header values must never contain CR/LF.  RFC 5987 filename* keeps
+        # non-ASCII names intact while the ASCII fallback remains compatible.
+        ascii_name = re.sub(r"[^\x20-\x7e]", "_", file_name).replace('"', "'")
+        encoded_name = quote(file_name, safe="")
+        disposition = "inline" if request.query.get("inline") == "1" else "attachment"
         headers = {
-            "Content-Type":        mime_type,
-            "Content-Range":       f"bytes {from_bytes}-{until_bytes}/{file_size}",
-            "Content-Disposition": f'attachment; filename="{file_properties.file_name}"; filename*=UTF-8\'\'{safe_file_name}',
-            "Accept-Ranges":       "bytes",
+            "Content-Type": str(file_properties.mime_type or "application/octet-stream"),
+            "Content-Length": str(requested_length),
+            "Content-Disposition": (
+                f"{disposition}; filename=\"{ascii_name}\"; "
+                f"filename*=UTF-8''{encoded_name}"
+            ),
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=3600",
         }
-        return web.Response(
-            status=206 if range_header else 200,
-            body=body,
-            headers=headers
+        if is_partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+        response = web.StreamResponse(status=206 if is_partial else 200, headers=headers)
+        await response.prepare(request)
+        if request.method == "HEAD":
+            await response.write_eof()
+            return response
+
+        body = TGCustomYield().yield_file(
+            file_id_obj,
+            aligned_offset,
+            first_part_cut,
+            last_part_cut,
+            part_count,
+            selected_chunk_size,
         )
-    except Exception as e:
-        return web.Response(text=f"<h1>Streaming Core Error: {e}</h1>", content_type='text/html')
+        try:
+            async for chunk in body:
+                await response.write(chunk)
+        except ConnectionResetError:
+            # The browser often cancels a request after seeking.  Do not turn
+            # a normal client disconnect into a noisy server error.
+            return response
+        finally:
+            if not response._eof_sent:
+                try:
+                    await response.write_eof()
+                except ConnectionResetError:
+                    pass
+        return response
+    except (ValueError, TypeError):
+        return web.Response(status=400, text="Invalid message id", content_type="text/plain")
+    except Exception:
+        # Do not leak Telegram credentials, file references, or stack details
+        # to a browser.  The full traceback remains in the process logs.
+        import logging
+
+        logging.exception("Streaming error")
+        return web.Response(status=502, text="Streaming is temporarily unavailable", content_type="text/plain")
 
 
 # ==========================================
@@ -268,13 +401,12 @@ async def download_handler(request):
 
 @routes.get("/login")
 async def login_page(request):
-    async with aiofiles.open('web/template/login.html', mode='r', encoding='utf-8') as r:
-        template_content = await r.read()
-    error = request.query.get('error', '')
-    error_html = f'<div class="error">{error}</div>' if error else ''
-    html = template_content.replace('<!--ERROR-->', error_html)
-    html = await inject_theme_script(html)
-    return web.Response(text=html, content_type='text/html')
+    template_content = await load_template("web/template/login.html")
+    error = request.query.get("error", "")
+    error_html = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    page_html = template_content.replace('<!--ERROR-->', error_html)
+    page_html = await inject_theme_script(page_html)
+    return web.Response(text=page_html, content_type='text/html')
 
 
 @routes.post("/login")
@@ -285,7 +417,15 @@ async def login_submit(request):
 
     if check_credentials(username, password):
         resp = web.HTTPFound("/panel")
-        resp.set_cookie("session", create_session_token(), max_age=SESSION_MAX_AGE, httponly=True)
+        resp.set_cookie(
+            "session",
+            create_session_token(),
+            max_age=SESSION_MAX_AGE,
+            httponly=True,
+            secure=URL.startswith("https://"),
+            samesite="Strict",
+            path="/",
+        )
         return resp
     return web.HTTPFound("/login?error=Invalid username or password")
 
@@ -304,8 +444,7 @@ async def logout(request):
 @routes.get("/panel")
 @login_required
 async def panel_page(request):
-    async with aiofiles.open('web/template/panel.html', mode='r', encoding='utf-8') as r:
-        template_content = await r.read()
+    template_content = await load_template("web/template/panel.html")
     html = await inject_theme_script(template_content)
     return web.Response(text=html, content_type='text/html')
 
@@ -313,17 +452,25 @@ async def panel_page(request):
 @routes.get("/panel/api/search")
 @login_required
 async def panel_search_api(request):
-    query  = request.query.get('q', '')
-    offset = int(request.query.get('offset', 0) or 0)
+    query = request.query.get("q", "")[:200]
+    try:
+        offset = max(0, int(request.query.get("offset", 0) or 0))
+    except (TypeError, ValueError):
+        return web.json_response({"error": "Invalid offset"}, status=400)
+
     files, next_offset, total = await get_search_results(query, offset=offset)
-
-    results = [{
-        "file_id":   f.file_id,
-        "file_name": f.file_name,
-        "file_size": get_size(f.file_size) if f.file_size else "0 Bytes"
-    } for f in files]
-
-    return web.json_response({"results": results, "next_offset": next_offset, "total": total})
+    results = [
+        {
+            "file_id": file.file_id,
+            "file_name": file.file_name,
+            "file_size": get_size(file.file_size),
+        }
+        for file in files
+    ]
+    return web.json_response(
+        {"results": results, "next_offset": next_offset, "total": total},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @routes.get("/panel/stream/{file_id}")
@@ -338,8 +485,8 @@ async def panel_stream(request):
         return web.Response(text="<h1>File not found! ❌</h1>", content_type='text/html')
 
     file = file_details[0]
-    msg  = await temp.BOT.send_cached_media(chat_id=BIN_CHANNEL, file_id=file.file_id)
+    msg = await get_bin_message(temp.BOT, BIN_CHANNEL, file.file_id)
 
-    if mode == 'download':
+    if mode == "download":
         return web.HTTPFound(f"{URL}download/{msg.id}")
     return web.HTTPFound(f"{URL}watch/{msg.id}")
